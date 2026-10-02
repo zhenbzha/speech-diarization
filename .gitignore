@@ -1,0 +1,34 @@
+# Python environments and caches
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+**/*.egg-info/
+
+# Local Azure and Foundry state
+.azure/
+**/.azure/
+.foundry/
+**/.foundry/
+.env
+.env.*
+!.env.example
+
+# Runtime outputs
+artifacts/
+**/artifacts/
+*.transcript.json
+*.transcript.md
+*.summary.md
+*.wav
+
+# Tooling and editors
+node_modules/
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
