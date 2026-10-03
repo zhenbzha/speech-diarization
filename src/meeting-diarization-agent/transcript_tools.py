@@ -15,7 +15,9 @@ def _format_timestamp(milliseconds: int) -> str:
 def _require_integer(value: Any, field: str, index: int) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"utterances[{index}].{field} must be a whole number")
-    if not math.isfinite(value) or not float(value).is_integer():
+    if isinstance(value, float) and (
+        not math.isfinite(value) or not value.is_integer()
+    ):
         raise ValueError(f"utterances[{index}].{field} must be a whole number")
     integer_value = int(value)
     if integer_value < 0:
@@ -64,13 +66,21 @@ def _normalize_utterance(value: Any, index: int) -> dict[str, Any]:
             f"utterances[{index}].locale must be a non-empty string when provided"
         )
 
-    overlaps_previous = value.get("overlaps_previous", False)
-    if not isinstance(overlaps_previous, bool):
+    overlaps_previous = value.get("overlaps_previous")
+    if "overlaps_previous" in value and not isinstance(overlaps_previous, bool):
         raise ValueError(
             f"utterances[{index}].overlaps_previous must be a boolean when provided"
         )
 
-    return {
+    confidence = value.get("confidence")
+    if confidence is not None and (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+    ):
+        raise ValueError(f"utterances[{index}].confidence must be between 0 and 1")
+
+    result = {
         "utterance_id": f"U{index + 1}",
         "speaker_id": speaker_id.strip(),
         "speaker_name": speaker_name.strip() if speaker_name else None,
@@ -82,9 +92,12 @@ def _normalize_utterance(value: Any, index: int) -> dict[str, Any]:
         "overlaps_previous": overlaps_previous,
         "text": text.strip(),
     }
+    if confidence is not None:
+        result["confidence"] = confidence
+    return result
 
 
-def build_transcript_evidence(transcript_json: str) -> str:
+def normalize_transcript(transcript_json: str) -> dict[str, Any]:
     try:
         payload = json.loads(transcript_json)
     except json.JSONDecodeError as exc:
@@ -103,6 +116,21 @@ def build_transcript_evidence(transcript_json: str) -> str:
     ]
     normalized.sort(key=lambda item: (item["start_ms"], item["end_ms"]))
 
+    previous_end_ms = 0
+    for item in normalized:
+        overlap = item["start_ms"] < previous_end_ms
+        item["overlap_flag_conflict"] = (
+            item["overlaps_previous"] is not None
+            and item["overlaps_previous"] != overlap
+        )
+        item["overlaps_previous"] = overlap
+        previous_end_ms = max(previous_end_ms, item["end_ms"])
+    return {**payload, "utterances": normalized}
+
+
+def build_transcript_evidence(transcript_json: str) -> str:
+    payload = normalize_transcript(transcript_json)
+    normalized = payload["utterances"]
     speaker_counts = Counter(item["speaker_id"] for item in normalized)
     anonymous_speakers = sorted(
         {
@@ -123,7 +151,7 @@ def build_transcript_evidence(transcript_json: str) -> str:
         display_name = item["speaker_name"] or item["speaker_id"]
         location = f", {item['location']}" if item["location"] else ""
         locale = f", {item['locale']}" if item["locale"] else ""
-        overlap = ", overlaps previous" if item["overlaps_previous"] else ""
+        overlap = ", timestamp overlaps previous" if item["overlaps_previous"] else ""
         evidence_lines.append(
             f"[{item['utterance_id']} {item['timestamp']}] "
             f"{display_name} "
@@ -141,6 +169,11 @@ def build_transcript_evidence(transcript_json: str) -> str:
             "speaker_utterance_counts": dict(sorted(speaker_counts.items())),
             "anonymous_speakers": anonymous_speakers,
             "overlap_utterances": overlaps,
+            "overlap_flag_conflicts": [
+                item["utterance_id"]
+                for item in normalized
+                if item["overlap_flag_conflict"]
+            ],
             "detected_locale_counts": dict(sorted(locale_counts.items())),
             "transcription_mode": payload.get("transcription_mode"),
             "requested_locale": payload.get("requested_locale"),
@@ -153,12 +186,13 @@ def build_transcript_evidence(transcript_json: str) -> str:
 def convert_speech_response(
     payload: dict[str, Any], source_file: str
 ) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Speech response must be a JSON object")
     phrases = payload.get("phrases")
     if not isinstance(phrases, list) or not phrases:
         raise ValueError("Speech response must contain a non-empty phrases array")
 
     utterances = []
-    previous_end_ms = 0
     for index, phrase in enumerate(phrases):
         if not isinstance(phrase, dict):
             raise ValueError(f"phrases[{index}] must be an object")
@@ -179,40 +213,41 @@ def convert_speech_response(
             raise ValueError(f"phrases[{index}].text must be a non-empty string")
 
         speaker = phrase.get("speaker")
-        if speaker is None or isinstance(speaker, bool):
+        if (
+            isinstance(speaker, bool)
+            or not isinstance(speaker, int)
+            or speaker < 0
+        ):
             raise ValueError(
-                f"phrases[{index}].speaker is missing; confirm diarization was enabled"
+                f"phrases[{index}].speaker must be a non-negative integer; "
+                "confirm diarization was enabled"
             )
-        speaker_id = str(speaker).strip()
-        if not speaker_id:
-            raise ValueError(f"phrases[{index}].speaker must not be empty")
-        if not speaker_id.lower().startswith("speaker"):
-            speaker_id = f"Speaker {speaker_id}"
 
         end_ms = start_ms + duration_ms
         utterance = {
-            "speaker_id": speaker_id,
+            "speaker_id": f"Speaker {speaker}",
             "start_ms": start_ms,
             "end_ms": end_ms,
             "text": text.strip(),
-            "overlaps_previous": start_ms < previous_end_ms,
         }
 
-        confidence = phrase.get("confidence")
-        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
-            utterance["confidence"] = confidence
-
-        locale = phrase.get("locale")
-        if isinstance(locale, str) and locale.strip():
-            utterance["locale"] = locale.strip()
+        for field in ("confidence", "locale"):
+            if field in phrase:
+                utterance[field] = phrase[field]
 
         utterances.append(utterance)
-        previous_end_ms = max(previous_end_ms, end_ms)
 
-    return {
+    result = {
         "title": Path(source_file).stem,
         "synthetic": None,
         "source_file": source_file,
         "speech_duration_ms": payload.get("durationMilliseconds"),
         "utterances": utterances,
     }
+    # Validate before persistence, but retain source order so evidence IDs remain
+    # stable when the persisted JSON is read again.
+    normalized = normalize_transcript(json.dumps(result))
+    for item in normalized["utterances"]:
+        index = int(item["utterance_id"][1:]) - 1
+        utterances[index]["overlaps_previous"] = item["overlaps_previous"]
+    return result

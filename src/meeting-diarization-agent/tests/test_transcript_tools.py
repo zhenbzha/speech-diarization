@@ -162,6 +162,77 @@ class BuildTranscriptEvidenceTests(unittest.TestCase):
         )
         self.assertIn("fr-FR", result["evidence"][1])
 
+    def test_derives_overlap_for_unsorted_and_nested_intervals(self):
+        payload = {"utterances": [
+            {"speaker_id": "P1", "start_ms": 10000, "end_ms": 11000, "text": "Later."},
+            {"speaker_id": "P2", "start_ms": 0, "end_ms": 9000, "text": "Long."},
+            {"speaker_id": "P3", "start_ms": 500, "end_ms": 1000, "text": "Nested."},
+            {"speaker_id": "P4", "start_ms": 2000, "end_ms": 3000, "text": "Also nested."},
+        ]}
+        result = json.loads(build_transcript_evidence(json.dumps(payload)))
+        self.assertEqual(result["meeting"]["overlap_utterances"], ["U3", "U4"])
+        self.assertTrue(result["evidence"][0].startswith("[U2 00:00:00]"))
+        self.assertTrue(result["evidence"][-1].startswith("[U1 00:00:10]"))
+
+    def test_flags_conflicting_supplied_overlap_metadata(self):
+        payload = {"utterances": [
+            {
+                "speaker_id": "P1", "start_ms": 0, "end_ms": 1000,
+                "text": "First.", "overlaps_previous": True,
+            },
+            {
+                "speaker_id": "P2", "start_ms": 500, "end_ms": 1500,
+                "text": "Overlapping.", "overlaps_previous": False,
+            },
+        ]}
+        result = json.loads(build_transcript_evidence(json.dumps(payload)))
+        self.assertEqual(result["meeting"]["overlap_utterances"], ["U2"])
+        self.assertEqual(result["meeting"]["overlap_flag_conflicts"], ["U1", "U2"])
+
+    def test_speech_order_does_not_create_false_overlap_or_change_ids_on_reload(self):
+        payload = {"phrases": [
+            {"speaker": 1, "offsetMilliseconds": 10000, "durationMilliseconds": 1000, "text": "Later."},
+            {"speaker": 2, "offsetMilliseconds": 0, "durationMilliseconds": 1000, "text": "Earlier."},
+        ]}
+        converted = convert_speech_response(payload, "meeting.mp4")
+        self.assertFalse(any(item["overlaps_previous"] for item in converted["utterances"]))
+        first = build_transcript_evidence(json.dumps(converted))
+        second = build_transcript_evidence(json.dumps(json.loads(json.dumps(converted))))
+        self.assertEqual(first, second)
+        self.assertEqual(json.loads(first)["meeting"]["overlap_utterances"], [])
+
+    def test_rejects_non_object_response_and_invalid_speaker_ids(self):
+        for payload in (None, [], "text"):
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, "JSON object"):
+                convert_speech_response(payload, "meeting.mp4")
+        for speaker in (None, True, -1, 1.5, "1", {}):
+            payload = {"phrases": [{
+                "speaker": speaker, "offsetMilliseconds": 0,
+                "durationMilliseconds": 1000, "text": "Test.",
+            }]}
+            with self.subTest(speaker=speaker), self.assertRaisesRegex(ValueError, "speaker"):
+                convert_speech_response(payload, "meeting.mp4")
+
+    def test_rejects_invalid_confidence_and_locale(self):
+        base = {
+            "speaker": 0, "offsetMilliseconds": 0,
+            "durationMilliseconds": 1000, "text": "Test.",
+        }
+        for confidence in (True, -0.1, 1.1, float("nan"), float("inf"), "0.5"):
+            with self.subTest(confidence=confidence), self.assertRaisesRegex(ValueError, "confidence"):
+                convert_speech_response({"phrases": [{**base, "confidence": confidence}]}, "meeting.mp4")
+        for locale in (True, "", 123):
+            with self.subTest(locale=locale), self.assertRaisesRegex(ValueError, "locale"):
+                convert_speech_response({"phrases": [{**base, "locale": locale}]}, "meeting.mp4")
+
+    def test_rejects_nonfinite_boolean_and_negative_timestamps(self):
+        for value in (True, -1, float("nan"), float("inf")):
+            payload = {"utterances": [{
+                "speaker_id": "P1", "start_ms": value, "end_ms": 1000, "text": "Test.",
+            }]}
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                build_transcript_evidence(json.dumps(payload))
+
 
 if __name__ == "__main__":
     unittest.main()
