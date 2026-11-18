@@ -128,7 +128,7 @@ def normalize_transcript(transcript_json: str) -> dict[str, Any]:
     return {**payload, "utterances": normalized}
 
 
-def build_transcript_evidence(transcript_json: str) -> str:
+def build_transcript_evidence(transcript_json: str) -> dict[str, Any]:
     payload = normalize_transcript(transcript_json)
     normalized = payload["utterances"]
     speaker_counts = Counter(item["speaker_id"] for item in normalized)
@@ -159,7 +159,7 @@ def build_transcript_evidence(transcript_json: str) -> str:
             f"{item['text']}"
         )
 
-    result = {
+    return {
         "meeting": {
             "title": payload.get("title"),
             "synthetic": payload.get("synthetic"),
@@ -180,7 +180,6 @@ def build_transcript_evidence(transcript_json: str) -> str:
         },
         "evidence": evidence_lines,
     }
-    return json.dumps(result, ensure_ascii=True, indent=2)
 
 
 def convert_speech_response(

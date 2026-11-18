@@ -5,6 +5,10 @@ meeting summaries. This Python application combines **Azure Speech** for
 transcription and diarization with **GPT-4.1** for meeting analysis, hosted in
 **Microsoft Foundry Agent Service**.
 
+This is a demo and starting-point sample, not a production-ready meeting archive.
+The implementation separates agent orchestration, file processing, transcript
+validation, and agent instructions into small, focused Python modules.
+
 The agent produces summaries, decisions, action items, and open questions, with
 timestamped references back to the transcript. It supports multilingual
 transcription and reuses saved transcripts for follow-up analysis.
@@ -30,7 +34,9 @@ Other example prompts:
 - "Can I download the transcript?"
 
 Keep follow-up requests in the same session. If you upload several recordings,
-include the filename in your prompt.
+include the filename in your prompt and process one meeting per request. A report
+cannot combine different transcripts or versions, because utterance IDs are
+local to each transcript.
 
 ### Generated files
 
@@ -43,9 +49,10 @@ For an uploaded `meeting.mp4`, the agent saves:
 - **`meeting.mp4.summary.md`** -- meeting summary, decisions, action items, risks,
   and unresolved questions.
 
-The final answer appears after the report has been validated and saved. Citation
-or processing errors are reported in chat rather than publishing an invalid
-report. Files remain in the hosted session, separate from the application code.
+The final answer appears after its citation IDs and timestamps have been checked
+and the report has been saved. Citation or processing errors are reported in chat.
+These checks do not establish that every claim is supported by its cited text.
+Files remain in the hosted session, separate from the application code.
 
 ## How it works
 
@@ -71,6 +78,10 @@ IDs, inserts the corresponding timestamps, and saves the report before returning
 it. Repeated analysis reuses the transcript when the recording and transcription
 settings are unchanged.
 
+Internal helpers return Python dictionaries; Agent Framework serializes tool
+results at the model boundary. Citation timestamps are read from normalized
+utterances, not parsed back out of display text.
+
 Multilingual transcription is the default. A request to change the summary's
 language does not change the original-language transcript.
 
@@ -83,7 +94,8 @@ speech-diarization\
     foundry-iq-hr-sales-meeting.mp4    Synthetic demo recording
   src\
     meeting-diarization-agent\
-      main.py                        Agent instructions, tools, and response handling
+      main.py                        Agent setup, tools, and response handling
+      prompts.py                     Version-controlled meeting-analysis prompt
       recording_tools.py             Speech API calls, session files, caching, report saving
       transcript_tools.py            Transcript conversion, validation, and evidence
       pyproject.toml                 Python dependencies
@@ -95,6 +107,11 @@ speech-diarization\
 Start with **`main.py`** to understand the agent. The Speech API call is in
 **`recording_tools.py`**, inside `transcribe_meeting_file()`.
 
+Edit **`prompts.py`** to change the agent's behavior and report format.
+`main.py` imports its `MEETING_INSTRUCTIONS` constant. Keep the prompt versioned
+with the application and deterministic safeguards in application logic rather
+than relying on prompt wording alone.
+
 ## Local development
 
 ### Prerequisites
@@ -103,7 +120,7 @@ Start with **`main.py`** to understand the agent. The Speech API call is in
 - A Microsoft Foundry project with a `gpt-4.1` deployment, or another compatible
   model configured through `AZURE_AI_MODEL_DEPLOYMENT_NAME`.
 - An Azure Speech resource in a region that supports Fast Transcription.
-- An Azure identity with model-inference access and the **Cognitive Services User**
+- An Azure identity with model-inference access and the **Cognitive Services Speech User**
   role on the Speech resource. See [Speech access control](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/role-based-access-control).
 - [Azure Developer CLI](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/install-azd)
   and the agent extension required by `azure.yaml` for local invocation and deployment.
@@ -186,19 +203,25 @@ uv run --no-sync python -m unittest discover -s tests -v
 ```
 
 The tests cover transcript conversion, file handling, caching, citations, and
-report persistence. Azure calls are mocked; running the suite does not require
-live service access.
+report persistence, including mixed-meeting requests and file-publication
+failures. Azure calls are mocked; running the suite does not require live service
+access. GitHub Actions runs the suite on Windows and Linux with Python 3.13.
 
 ## Deploy to Foundry
 
 The root `azure.yaml` defines a Python 3.13 hosted agent using the Responses
-protocol and remote dependency builds.
+protocol and remote dependency builds. This sample uses source-code deployment
+only; no Dockerfile or local container build is required.
 
 Configure an `azd` environment for your target Foundry project following the
 [hosted-agent deployment guide](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/deploy-hosted-agent-code).
 Set `AZURE_AI_MODEL_DEPLOYMENT_NAME` and `AZURE_SPEECH_ENDPOINT` in that
 environment, and grant the hosted agent's identity access to the model and Speech.
 Review the model and capacity settings in `azure.yaml` before provisioning resources.
+The model capacity starts at 10 for this demo; adjust it to your workload and
+available quota. The deployed environment disables Python user-site imports with
+`PYTHONNOUSERSITE=1`. Local `.env` loading is restricted to the agent's source
+directory and is disabled in Foundry.
 
 Once the environment and resources are configured, deploy from the repository root:
 
@@ -208,7 +231,11 @@ azd deploy
 
 Leave `MEETING_SESSION_DIR` unset in the hosted environment; Foundry provides
 isolated session storage. Local `.env`, `.azure`, virtual environments, and
-generated transcripts are excluded from Git.
+generated transcripts are excluded from Git. Source-code deployment uses the
+service's `.agentignore`, independently of `.gitignore`; it excludes local
+session directories, recordings, transcripts, summaries, and recovery files.
+Keep arbitrary uploaded JSON and other session data in `artifacts` or outside
+the source directory rather than alongside application code.
 
 ## Scope
 
@@ -217,6 +244,24 @@ not implement live meeting capture or asynchronous batch processing. See the
 [Speech guide](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create)
 and [hosted-session documentation](https://learn.microsoft.com/en-us/azure/foundry/agents/how-to/manage-hosted-sessions)
 for supported languages, media requirements, and service limits.
+
+### What the safeguards do and do not guarantee
+
+- Citation validation checks that references exist and that explicit timestamps
+  match. It does not check every claim for a citation or prove that cited text
+  supports a claim. Review generated decisions, owners, and deadlines.
+- Tool results label a fresh Speech response as `azure-speech`, reused file
+  evidence as `cached-transcript`, and directly supplied JSON as `user-supplied`.
+  Uploaded JSON cannot assign its own trusted origin. Cache fingerprints and
+  transcript hashes detect changes, not authenticity; session files remain
+  editable by callers with upload access.
+- Artifact updates are staged and ordinary write failures restore the previous
+  files. This is not a crash-safe database transaction. If restoration also
+  fails, the error identifies a session directory containing recovery copies.
+- Unit tests check application behavior, not recognition or summary quality.
+  Before adapting the sample for real use, evaluate representative multilingual,
+  noisy, and overlapping recordings against separate ground-truth transcripts
+  and expected decisions/actions. Do not put expected answers into agent instructions.
 
 Diarization distinguishes speakers, not their identities or meeting locations.
 Use recordings with appropriate authorization, evaluate with representative

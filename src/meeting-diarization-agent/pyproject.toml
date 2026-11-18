@@ -4,10 +4,15 @@ version = "0.1.0"
 description = "A Microsoft Foundry hosted agent for meeting transcription, speaker diarization, and evidence-linked summaries."
 requires-python = ">=3.13"
 dependencies = [
-    "agent-framework-foundry",
+    "agent-framework-core>=1.17.0",
+    "agent-framework-foundry>=1.12.0",
     "agent-framework-foundry-hosting>=1.0.0b260813",
-    "debugpy",
+    "azure-core",
+    "azure-identity",
+    "httpx",
+    "pydantic",
+    "python-dotenv",
 ]
 
 [tool.setuptools]
-py-modules = ["main", "recording_tools", "transcript_tools"]
+py-modules = ["main", "prompts", "recording_tools", "transcript_tools"]

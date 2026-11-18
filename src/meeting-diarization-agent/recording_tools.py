@@ -2,15 +2,21 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from threading import RLock
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
 from azure.identity import DefaultAzureCredential
 
-from transcript_tools import build_transcript_evidence, convert_speech_response
+from transcript_tools import (
+    build_transcript_evidence,
+    convert_speech_response,
+    normalize_transcript,
+)
 
 
 ALLOWED_SUFFIXES = {".mp4", ".wav", ".mp3", ".m4a", ".aac", ".webm"}
@@ -109,7 +115,7 @@ def discover_uploaded_recording() -> Path:
     return _validate_recording(_choose_file(paths))
 
 
-def resolve_session_file(file_path: str) -> Path:
+def resolve_recording_path(file_path: str) -> Path:
     if not file_path.strip():
         return discover_uploaded_recording()
     return _validate_recording(_resolve_session_path(file_path))
@@ -145,20 +151,50 @@ def _file_digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    _contained_path(path)
-    temporary = None
+def _publish_artifacts(updates: dict[Path, str | None]) -> None:
+    """Stage replacements/deletions and roll back ordinary publication failures."""
+    for path in updates:
+        _contained_path(path)
+    staging = Path(tempfile.mkdtemp(
+        dir=next(iter(updates)).parent, prefix=".meeting-artifacts-",
+    ))
+    staged = {}
+    backups = {}
+    published = []
+    keep_backups = False
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="\n", dir=path.parent,
-            prefix=f".{path.name}.", suffix=".tmp", delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
-            stream.write(content)
-        temporary.replace(path)
+        for index, (path, content) in enumerate(updates.items()):
+            if content is not None:
+                staged[path] = staging / f"{index}.new"
+                staged[path].write_text(content, encoding="utf-8", newline="\n")
+            if path.exists():
+                backups[path] = staging / f"{index}.old"
+                shutil.copyfile(path, backups[path])
+        try:
+            for path, content in updates.items():
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    staged[path].replace(path)
+                published.append(path)
+        except OSError:
+            try:
+                for path in reversed(published):
+                    if path in backups:
+                        backups[path].replace(path)
+                    else:
+                        path.unlink(missing_ok=True)
+            except OSError as exc:
+                keep_backups = True
+                raise MeetingProcessingError(
+                    "artifact_recovery_error",
+                    "Saving artifacts and restoring previous versions failed. "
+                    f"Recovery copies remain in the session folder {staging.name}.",
+                ) from exc
+            raise
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        if not keep_backups:
+            shutil.rmtree(staging)
 
 
 def _report_path(transcript_path: Path) -> Path:
@@ -167,39 +203,45 @@ def _report_path(transcript_path: Path) -> Path:
     )
 
 
-def _persist_evidence(transcript_json: str, transcript_path: Path) -> str:
-    evidence = json.loads(build_transcript_evidence(transcript_json))
+def _persist_transcript_artifacts(
+    transcript_json: str,
+    transcript_path: Path,
+    *,
+    evidence_source: Literal["azure-speech", "cached-transcript", "user-supplied"],
+) -> dict[str, Any]:
+    evidence = build_transcript_evidence(transcript_json)
     _contained_path(transcript_path)
     report_path = _report_path(transcript_path)
+    readable_path = transcript_path.with_suffix(".md")
+    updates: dict[Path, str | None] = {
+        transcript_path: transcript_json,
+        readable_path: "# Meeting transcript\n\n" + "\n\n".join(evidence["evidence"]) + "\n",
+    }
     if (
         transcript_path.exists()
         and transcript_path.read_text(encoding="utf-8") != transcript_json
     ):
-        _contained_path(report_path)
-        report_path.unlink(missing_ok=True)
-    readable_path = transcript_path.with_suffix(".md")
-    _atomic_write(
-        readable_path,
-        "# Meeting transcript\n\n" + "\n\n".join(evidence["evidence"]) + "\n",
-    )
-    _atomic_write(transcript_path, transcript_json)
+        updates[report_path] = None
+    _publish_artifacts(updates)
     digest = _text_digest(transcript_json)
     evidence["status"] = "ok"
     evidence["meeting"].update(
         transcript_file=str(transcript_path),
         transcript_sha256=digest,
         readable_transcript_file=str(readable_path),
-        evidence_source=json.loads(transcript_json).get("evidence_source", "user-supplied"),
+        evidence_source=evidence_source,
     )
     if report_path.is_file():
         _contained_path(report_path)
         marker = f"<!-- transcript-sha256: {digest} -->"
         if report_path.read_text(encoding="utf-8").endswith(marker + "\n"):
             evidence["meeting"]["summary_file"] = str(report_path)
-    return json.dumps(evidence, ensure_ascii=True, indent=2)
+    return evidence
 
 
-def inspect_transcript(transcript_json: str = "", file_path: str = "") -> str:
+def inspect_transcript(
+    transcript_json: str = "", file_path: str = "",
+) -> dict[str, Any]:
     with _artifact_lock:
         if bool(transcript_json.strip()) == bool(file_path.strip()):
             raise ValueError("Provide either transcript_json or a transcript file path.")
@@ -217,7 +259,9 @@ def inspect_transcript(transcript_json: str = "", file_path: str = "") -> str:
                 f"supplied-{_text_digest(transcript_json)[:16]}{TRANSCRIPT_SUFFIX}"
             )
         # Validation is structural, not proof that user-supplied statements are true.
-        return _persist_evidence(transcript_json, target)
+        return _persist_transcript_artifacts(
+            transcript_json, target, evidence_source="user-supplied",
+        )
 
 
 def _speech_endpoint() -> str:
@@ -240,10 +284,10 @@ def transcribe_meeting_file(
     locale: str = "",
     max_speakers: int = 10,
     force_retranscribe: bool = False,
-) -> str:
+) -> dict[str, Any]:
     definition = build_transcription_definition(locale, max_speakers)
     with _artifact_lock:
-        path = resolve_session_file(file_path)
+        path = resolve_recording_path(file_path)
         fingerprint = {
             "version": CACHE_VERSION,
             "recording_sha256": _file_digest(path),
@@ -256,7 +300,9 @@ def transcribe_meeting_file(
             cached_json = transcript_path.read_text(encoding="utf-8")
             build_transcript_evidence(cached_json)
             if json.loads(cached_json).get("transcription_request") == fingerprint:
-                return _persist_evidence(cached_json, transcript_path)
+                return _persist_transcript_artifacts(
+                    cached_json, transcript_path, evidence_source="cached-transcript",
+                )
 
         endpoint = _speech_endpoint()
         with DefaultAzureCredential() as credential, httpx.Client(
@@ -304,14 +350,16 @@ def transcribe_meeting_file(
             requested_locale=locale.strip() or None,
             transcription_request=fingerprint,
         )
-        return _persist_evidence(
-            json.dumps(transcript, ensure_ascii=True, indent=2), transcript_path
+        return _persist_transcript_artifacts(
+            json.dumps(transcript, ensure_ascii=True, indent=2),
+            transcript_path,
+            evidence_source="azure-speech",
         )
 
 
 def save_meeting_report(
     report_markdown: str, transcript_file: str, transcript_sha256: str
-) -> str:
+) -> dict[str, Any]:
     if not report_markdown.strip():
         raise ValueError("The meeting report must not be empty.")
     with _artifact_lock:
@@ -319,14 +367,16 @@ def save_meeting_report(
         if not transcript_path.name.endswith(TRANSCRIPT_SUFFIX):
             raise ValueError("The report source must be a persisted transcript JSON file.")
         transcript_json = transcript_path.read_text(encoding="utf-8")
-        evidence = json.loads(build_transcript_evidence(transcript_json))
+        transcript = normalize_transcript(transcript_json)
         digest = _text_digest(transcript_json)
         if digest != transcript_sha256:
             raise ValueError("The transcript changed. Ingest it again before saving a report.")
-        valid_references = {line.split("]", 1)[0] + "]" for line in evidence["evidence"]}
         canonical_references = {
-            reference.split(" ", 1)[0] + "]": reference for reference in valid_references
+            f"[{utterance['utterance_id']}]":
+                f"[{utterance['utterance_id']} {utterance['timestamp']}]"
+            for utterance in transcript["utterances"]
         }
+        valid_references = set(canonical_references.values())
         references = re.findall(r"\[U[^\]\r\n]*\]", report_markdown)
         invalid_references = [
             ref for ref in references
@@ -350,20 +400,13 @@ def save_meeting_report(
             report_markdown,
         )
         report_path = _report_path(transcript_path)
-        _atomic_write(
-            report_path,
-            report_markdown.strip() + f"\n\n<!-- transcript-sha256: {digest} -->\n",
-        )
-        return json.dumps(
-            {
-                "status": "ok",
-                "summary_file": str(report_path),
-                "transcript_sha256": digest,
-                "report_markdown": report_markdown.strip(),
-                "download_instruction": (
-                    "Open the Files tab in the Foundry Playground and download "
-                    f"{report_path.name}."
-                ),
-            },
-            ensure_ascii=True,
-        )
+        _publish_artifacts({
+            report_path: report_markdown.strip()
+            + f"\n\n<!-- transcript-sha256: {digest} -->\n",
+        })
+        return {
+            "status": "ok",
+            "summary_file": str(report_path),
+            "transcript_sha256": digest,
+            "report_markdown": report_markdown.strip(),
+        }

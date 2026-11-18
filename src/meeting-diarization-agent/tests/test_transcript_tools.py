@@ -31,7 +31,7 @@ class BuildTranscriptEvidenceTests(unittest.TestCase):
             ],
         }
 
-        result = json.loads(build_transcript_evidence(json.dumps(payload)))
+        result = build_transcript_evidence(json.dumps(payload))
 
         self.assertEqual(result["meeting"]["speaker_count"], 2)
         self.assertEqual(result["meeting"]["detected_locale_counts"], {})
@@ -87,7 +87,7 @@ class BuildTranscriptEvidenceTests(unittest.TestCase):
             ]
         }
 
-        result = json.loads(build_transcript_evidence(json.dumps(payload)))
+        result = build_transcript_evidence(json.dumps(payload))
 
         self.assertEqual(result["meeting"]["duration_ms"], 1000)
 
@@ -154,7 +154,7 @@ class BuildTranscriptEvidenceTests(unittest.TestCase):
             ]
         }
 
-        result = json.loads(build_transcript_evidence(json.dumps(payload)))
+        result = build_transcript_evidence(json.dumps(payload))
 
         self.assertEqual(
             result["meeting"]["detected_locale_counts"],
@@ -169,7 +169,7 @@ class BuildTranscriptEvidenceTests(unittest.TestCase):
             {"speaker_id": "P3", "start_ms": 500, "end_ms": 1000, "text": "Nested."},
             {"speaker_id": "P4", "start_ms": 2000, "end_ms": 3000, "text": "Also nested."},
         ]}
-        result = json.loads(build_transcript_evidence(json.dumps(payload)))
+        result = build_transcript_evidence(json.dumps(payload))
         self.assertEqual(result["meeting"]["overlap_utterances"], ["U3", "U4"])
         self.assertTrue(result["evidence"][0].startswith("[U2 00:00:00]"))
         self.assertTrue(result["evidence"][-1].startswith("[U1 00:00:10]"))
@@ -185,7 +185,7 @@ class BuildTranscriptEvidenceTests(unittest.TestCase):
                 "text": "Overlapping.", "overlaps_previous": False,
             },
         ]}
-        result = json.loads(build_transcript_evidence(json.dumps(payload)))
+        result = build_transcript_evidence(json.dumps(payload))
         self.assertEqual(result["meeting"]["overlap_utterances"], ["U2"])
         self.assertEqual(result["meeting"]["overlap_flag_conflicts"], ["U1", "U2"])
 
@@ -199,7 +199,7 @@ class BuildTranscriptEvidenceTests(unittest.TestCase):
         first = build_transcript_evidence(json.dumps(converted))
         second = build_transcript_evidence(json.dumps(json.loads(json.dumps(converted))))
         self.assertEqual(first, second)
-        self.assertEqual(json.loads(first)["meeting"]["overlap_utterances"], [])
+        self.assertEqual(first["meeting"]["overlap_utterances"], [])
 
     def test_rejects_non_object_response_and_invalid_speaker_ids(self):
         for payload in (None, [], "text"):

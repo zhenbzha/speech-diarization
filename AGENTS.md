@@ -6,7 +6,15 @@ This project was built with the microsoft-foundry skill. Before working on or an
 
 ## Key files
 
-- `Dockerfile` — container definition
+- `azure.yaml` — source-code deployment configuration; Foundry builds the container
+- `src\meeting-diarization-agent\main.py` — agent setup, tools, and response handling
+- `src\meeting-diarization-agent\prompts.py` — version-controlled agent prompt
+- `src\meeting-diarization-agent\recording_tools.py` — Speech requests and session artifacts
+- `src\meeting-diarization-agent\transcript_tools.py` — transcript validation and evidence
+
+This is a shareable demo and starting-point sample. Prefer clear functions and
+small, focused changes over production-scale abstractions. Keep the existing
+source-code deployment path; there is no separate Docker build to maintain.
 
 ## Development workflow
 

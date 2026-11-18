@@ -19,10 +19,17 @@ __pycache__/
 # Runtime outputs
 artifacts/
 **/artifacts/
+.meeting-artifacts-*/
 *.transcript.json
 *.transcript.md
 *.summary.md
+*.mp4
 *.wav
+*.mp3
+*.m4a
+*.aac
+*.webm
+!assets/*.mp4
 
 # Tooling and editors
 node_modules/

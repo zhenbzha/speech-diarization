@@ -8,8 +8,10 @@ from unittest.mock import Mock, patch
 
 import httpx
 from agent_framework import (
-    AgentContext, AgentResponse, AgentResponseUpdate, Content, Message, ResponseStream,
+    AgentContext, AgentResponse, AgentResponseUpdate, ChatResponse, ChatResponseUpdate,
+    Content, Message, ResponseStream,
 )
+from agent_framework.openai import OpenAIChatClient
 from azure.core.exceptions import ClientAuthenticationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,8 +21,8 @@ from recording_tools import MeetingProcessingError, inspect_transcript, save_mee
 
 class ToolErrorTests(unittest.TestCase):
     def test_success_preserves_tool_result(self):
-        result = '{"status": "ok", "evidence": ["test"]}'
-        self.assertEqual(main._run_tool(lambda: result), result)
+        result = {"status": "ok", "evidence": ["test"]}
+        self.assertEqual(main._run_operation(lambda: result), result)
 
     def test_expected_errors_are_actionable_and_not_success_shaped(self):
         cases = [
@@ -36,7 +38,7 @@ class ToolErrorTests(unittest.TestCase):
                 raise exception
 
             with self.subTest(code=code), self.assertLogs("main", level="WARNING") as logs:
-                result = json.loads(main._run_tool(fail))
+                result = main._run_operation(fail)
             self.assertEqual(result["status"], "error")
             self.assertEqual(result["error"]["code"], code)
             self.assertIn(message, result["error"]["message"])
@@ -48,7 +50,7 @@ class ToolErrorTests(unittest.TestCase):
 
         with self.assertLogs("main", level="ERROR"):
             with self.assertRaisesRegex(RuntimeError, "unexpected failure"):
-                main._run_tool(fail)
+                main._run_operation(fail)
 
 
 class AgentSetupTests(unittest.TestCase):
@@ -79,13 +81,26 @@ class AgentSetupTests(unittest.TestCase):
         client.assert_not_called()
 
     def test_server_shutdown_closes_owned_credential(self):
-        with patch("main.DefaultAzureCredential") as credential, patch(
+        with patch("main.load_dotenv"), patch("main.DefaultAzureCredential") as credential, patch(
             "main.create_agent"
         ) as create, patch("main.ResponsesHostServer") as server:
             main.main()
         create.assert_called_once_with(credential.return_value.__enter__.return_value)
         server.return_value.run.assert_called_once()
         credential.return_value.__exit__.assert_called_once()
+
+    def test_only_local_startup_loads_the_source_directory_env_file(self):
+        for hosting_environment in ("", "1"):
+            with self.subTest(hosted=bool(hosting_environment)), patch.dict(
+                os.environ, {"FOUNDRY_HOSTING_ENVIRONMENT": hosting_environment},
+            ), patch("main.load_dotenv") as load, patch(
+                "main.DefaultAzureCredential"
+            ), patch("main.create_agent"), patch("main.ResponsesHostServer"):
+                main.main()
+                if hosting_environment:
+                    load.assert_not_called()
+                else:
+                    load.assert_called_once_with(Path(main.__file__).with_name(".env"))
 
 
 class RegisteredToolTests(unittest.IsolatedAsyncioTestCase):
@@ -114,10 +129,10 @@ class RegisteredToolTests(unittest.IsolatedAsyncioTestCase):
             )
             evidence = json.loads(inspected[0].text)
             report = "# Summary\n\nPilot approved. [U1 00:00:00]"
-            result = json.loads(save_meeting_report(
+            result = save_meeting_report(
                 report, evidence["meeting"]["transcript_file"],
                 evidence["meeting"]["transcript_sha256"],
-            ))
+            )
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["report_markdown"], report)
             self.assertTrue(Path(result["summary_file"]).read_text().startswith(report))
@@ -137,10 +152,10 @@ class ResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
         environment = patch.dict(os.environ, {"MEETING_SESSION_DIR": directory.name})
         environment.start()
         self.addCleanup(environment.stop)
-        self.evidence = json.loads(inspect_transcript(json.dumps({"utterances": [{
+        self.evidence = inspect_transcript(json.dumps({"utterances": [{
             "speaker_id": "Speaker 1", "start_ms": 0, "end_ms": 1000,
             "text": "Pilot approved.",
-        }]})))
+        }]}))
         self.meeting = self.evidence["meeting"]
         self.report = "# Summary\n\nPilot approved. [U1 00:00:00]"
         transcript = Path(self.meeting["transcript_file"])
@@ -213,6 +228,55 @@ class ResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("function_call", kinds)
         self.assertIn("function_result", kinds)
 
+    async def test_real_framework_tool_loop_persists_both_response_modes(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                tool_choices = []
+
+                def model_response(client, *, messages, options, stream=False, **kwargs):
+                    tool_choices.append(options.get("tool_choice"))
+                    first_turn = len(tool_choices) == 1
+                    contents = [
+                        Content.from_function_call(
+                            "inspect", "inspect_diarized_transcript",
+                            arguments=json.dumps({"file_path": self.meeting["transcript_file"]}),
+                        )
+                    ] if first_turn else [Content.from_text("Pilot approved. [U1]")]
+                    finish_reason = "tool_calls" if first_turn else "stop"
+                    if stream:
+                        async def updates():
+                            yield ChatResponseUpdate(
+                                role="assistant", contents=contents,
+                                message_id=f"model-message-{len(tool_choices)}",
+                                finish_reason=finish_reason,
+                            )
+                        return ResponseStream(updates(), finalizer=ChatResponse.from_updates)
+
+                    async def response():
+                        return ChatResponse(
+                            messages=[Message(role="assistant", contents=contents)],
+                            finish_reason=finish_reason,
+                        )
+                    return response()
+
+                client = OpenAIChatClient(model="offline", async_client=Mock())
+                with patch.dict(os.environ, {
+                    "FOUNDRY_PROJECT_ENDPOINT": "https://example.test/api/projects/test",
+                    "AZURE_AI_MODEL_DEPLOYMENT_NAME": "offline",
+                }), patch("main.FoundryChatClient", return_value=client), patch.object(
+                    OpenAIChatClient, "_inner_get_response", model_response,
+                ):
+                    agent = main.create_agent(None)
+                    if streaming:
+                        result_stream = agent.run("Summarize the transcript.", stream=True)
+                        result = await result_stream.get_final_response()
+                    else:
+                        result = await agent.run("Summarize the transcript.")
+                self.assertEqual(tool_choices, ["required", None])
+                self.assertIn("Pilot approved. [U1 00:00:00]", result.text)
+                self.assertIn(self.report_path.name, result.text)
+                self.assertTrue(self.report_path.read_text().startswith("Pilot approved."))
+
     async def test_id_only_citations_are_rendered_from_authoritative_evidence(self):
         response = await self.process(self.response(
             answer=self.report.replace("[U1 00:00:00]", "[U1]"),
@@ -231,7 +295,7 @@ class ResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.report, self.meeting["transcript_file"], self.meeting["transcript_sha256"],
         )
         before = self.report_path.read_bytes()
-        evidence = json.loads(inspect_transcript(file_path=self.meeting["transcript_file"]))
+        evidence = inspect_transcript(file_path=self.meeting["transcript_file"])
         with patch("main.save_meeting_report") as save:
             response = await self.process(self.response(
                 tool_name="get_meeting_files", evidence=evidence,
@@ -254,7 +318,7 @@ class ResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
         save_meeting_report(
             self.report, self.meeting["transcript_file"], self.meeting["transcript_sha256"],
         )
-        evidence = json.loads(inspect_transcript(file_path=self.meeting["transcript_file"]))
+        evidence = inspect_transcript(file_path=self.meeting["transcript_file"])
         response = await self.process(self.response(
             tool_name="inspect_diarized_transcript", evidence=evidence,
             answer="# New analysis\n\nPilot approved. [U1]",
@@ -273,6 +337,69 @@ class ResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
         text = "".join(update.text for update in updates)
         self.assertIn("Report saving failed (invalid_input)", text)
         self.assertNotIn("Unsupported claim", text)
+        self.assertFalse(self.report_path.exists())
+
+    async def test_mixed_meetings_never_overwrite_an_existing_report(self):
+        other = inspect_transcript(json.dumps({"utterances": [{
+            "speaker_id": "Speaker 1", "start_ms": 0, "end_ms": 1000,
+            "text": "Pilot rejected.",
+        }]}))
+        other_meeting = other["meeting"]
+        saved = save_meeting_report(
+            "Pilot rejected. [U1]", other_meeting["transcript_file"],
+            other_meeting["transcript_sha256"],
+        )
+        other_report = Path(saved["summary_file"])
+        before = other_report.read_bytes()
+        for tool_name in ("get_meeting_files", "inspect_diarized_transcript"):
+            for streaming in (False, True):
+                with self.subTest(tool_name=tool_name, streaming=streaming):
+                    response = self.response()
+                    response.messages[2:2] = [
+                        Message(role="assistant", contents=[
+                            Content.from_function_call("other", tool_name, arguments="{}"),
+                        ]),
+                        Message(role="tool", contents=[
+                            Content.from_function_result("other", result=other),
+                        ]),
+                    ]
+                    with self.assertLogs("main", level="WARNING"):
+                        result = await self.process(response, streaming=streaming)
+                        if streaming:
+                            result = await result.get_final_response()
+                    self.assertIn("multiple_transcripts", result.text)
+                    self.assertNotIn("Pilot approved", result.text)
+                    self.assertFalse(self.report_path.exists())
+                    self.assertEqual(other_report.read_bytes(), before)
+
+    async def test_same_transcript_analysis_and_download_calls_can_share_a_report(self):
+        response = self.response()
+        response.messages[2:2] = [
+            Message(role="assistant", contents=[
+                Content.from_function_call("download", "get_meeting_files", arguments="{}"),
+            ]),
+            Message(role="tool", contents=[
+                Content.from_function_result("download", result=self.evidence),
+            ]),
+        ]
+        result = await self.process(response)
+        self.assertTrue(result.text.startswith(self.report))
+        self.assertTrue(self.report_path.is_file())
+
+    async def test_different_versions_of_one_transcript_are_rejected(self):
+        changed = {**self.evidence, "meeting": {**self.meeting, "transcript_sha256": "new-version"}}
+        response = self.response()
+        response.messages[2:2] = [
+            Message(role="assistant", contents=[
+                Content.from_function_call("changed", "analyze_meeting_recording", arguments="{}"),
+            ]),
+            Message(role="tool", contents=[
+                Content.from_function_result("changed", result=changed),
+            ]),
+        ]
+        with self.assertLogs("main", level="WARNING"):
+            result = await self.process(response)
+        self.assertIn("multiple_transcripts", result.text)
         self.assertFalse(self.report_path.exists())
 
     async def test_incorrect_explicit_timestamp_is_rejected_not_silently_repaired(self):
@@ -312,9 +439,10 @@ class ResponsePersistenceTests(unittest.IsolatedAsyncioTestCase):
         error = {"status": "error", "error": {
             "code": "invalid_input", "message": "Upload a meeting recording.",
         }}
-        response = await self.process(self.response(
-            evidence=error, answer="Invented summary is available.",
-        ))
+        with self.assertLogs("main", level="WARNING"):
+            response = await self.process(self.response(
+                evidence=error, answer="Invented summary is available.",
+            ))
         self.assertIn("Upload a meeting recording", response.text)
         self.assertNotIn("Invented summary", response.text)
         self.assertFalse(self.report_path.exists())
